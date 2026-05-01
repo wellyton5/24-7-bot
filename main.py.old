@@ -1,0 +1,358 @@
+import asyncio
+import io
+import json
+import os
+import re
+import math
+import requests
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+import database
+from ftp_helpers import connect_ftp, download_file, upload_file
+
+# --- CONFIGURAÇÃO ---
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+NITRADO_TOKEN = os.getenv("NITRADO_TOKEN")
+SERVICE_ID = os.getenv("SERVICE_ID")
+BAN_CHANNEL_ID = os.getenv("BAN_CHANNEL")
+
+# Caminhos Nitrado
+GAMEPLAY_CONFIG_PATH = "/dayzxb_missions/dayzOffline.chernarusplus/cfggameplay.json"
+LOCAL_GAMEPLAY_CONFIG = "cfggameplay_temp.json"
+
+# Estado Global do Monitor
+current_log_file = None
+last_byte_offset = 0
+_log_check_counter = 0
+_player_id_cache = {}
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- HELPERS ---
+
+
+def _is_garden(item_name):
+    return "GardenPlot" in item_name
+
+
+def _is_fireplace(item_name):
+    return "Fireplace" in item_name
+
+
+def _is_garden_or_fireplace(item_name):
+    return _is_garden(item_name) or _is_fireplace(item_name)
+
+
+async def restart_nitrado():
+    if not NITRADO_TOKEN or not SERVICE_ID:
+        print("[NITRADO] Erro: Credenciais ausentes no .env")
+        return False
+    url = f"https://api.nitrado.net/services/{SERVICE_ID}/gameservers/restart"
+    headers = {"Authorization": f"Bearer {NITRADO_TOKEN}"}
+    try:
+        response = requests.post(url, headers=headers)
+        if response.status_code == 200:
+            print("[NITRADO] Comando de restart enviado com sucesso!")
+            return True
+        else:
+            print(
+                f"[NITRADO] Erro no restart: {response.status_code} - {response.text}"
+            )
+            return False
+    except Exception as e:
+        print(f"[NITRADO] Erro de conexao: {e}")
+        return False
+
+
+# --- COMANDOS DE JOGADOR ---
+
+
+@bot.command(name="vincular")
+async def vincular(ctx, gamertag: str):
+    """Vincula o Discord do jogador ao seu Gamertag no Bot 24/7."""
+    database.add_clan_member(0, ctx.author.id, gamertag)
+    await ctx.send(
+        f"✅ **{ctx.author.display_name}**, seu Gamertag **{gamertag}** foi vinculado com sucesso!"
+    )
+
+
+@bot.group(name="clan", invoke_without_command=True)
+async def clan(ctx):
+    await ctx.send(
+        "📜 **Comandos de Clã:**\n`!clan criar <nome>` - Cria um novo clã\n`!clan convidar @membro` - Convida um membro\n`!clan sair` - Sai do clã atual"
+    )
+
+
+@clan.command(name="criar")
+async def clan_criar(ctx, *, name: str):
+    if database.get_clan_by_leader(ctx.author.id):
+        return await ctx.send("❌ Você já é líder de um clã!")
+
+    clan_id = database.create_clan(name, ctx.author.id)
+    if clan_id:
+        gt = database.get_gamertag_by_discord(ctx.author.id)
+        database.add_clan_member(clan_id, ctx.author.id, gt)
+        await ctx.send(f"✅ Clã **{name}** criado com sucesso!")
+    else:
+        await ctx.send("❌ Esse nome de clã já existe.")
+
+
+@clan.command(name="convidar")
+async def clan_convidar(ctx, member: discord.Member):
+    clan_info = database.get_clan_by_leader(ctx.author.id)
+    if not clan_info:
+        return await ctx.send("❌ Apenas o líder do clã pode convidar membros.")
+
+    gt = database.get_gamertag_by_discord(member.id)
+    if not gt:
+        return await ctx.send(
+            f"❌ {member.mention} precisa usar `!vincular <gamertag>` primeiro."
+        )
+
+    database.add_clan_member(clan_info["id"], member.id, gt)
+    await ctx.send(
+        f"✅ {member.mention} foi adicionado ao clã **{clan_info['name']}**!"
+    )
+
+
+@bot.group(name="base", invoke_without_command=True)
+async def base(ctx):
+    await ctx.send(
+        "🏰 **Comandos de Base:**\n`!base autorizar @amigo` - Autoriza um amigo na sua base\n`!base remover @amigo` - Remove autorização"
+    )
+
+
+@base.command(name="autorizar")
+async def base_autorizar(ctx, member: discord.Member):
+    bases = database.get_security_bases()
+    author_gt = database.get_gamertag_by_discord(ctx.author.id)
+    owned_bases = [
+        b
+        for b in bases
+        if b["owner_discord_id"] == str(ctx.author.id) or b["owner"] == author_gt
+    ]
+
+    if not owned_bases:
+        return await ctx.send("❌ Você não é proprietário de nenhuma base registrada.")
+
+    guest_gt = database.get_gamertag_by_discord(member.id)
+    if not guest_gt:
+        return await ctx.send(
+            f"❌ O jogador {member.mention} precisa usar `!vincular` primeiro."
+        )
+
+    for b in owned_bases:
+        database.authorize_guest(b["id"], guest_gt, ctx.author.id)
+
+    await ctx.send(f"✅ {member.mention} ({guest_gt}) foi autorizado em suas bases!")
+
+
+# --- LOG PARSER & LOGIC ---
+
+
+async def parse_log_line(line):
+    line = line.strip()
+    if not line or "pos=<" not in line:
+        return
+
+    try:
+        player_name = line.split('Player "')[1].split('"')[0]
+        coords = line.split("pos=<")[1].split(">")[0].split(",")
+        x, z = float(coords[0]), float(coords[2])
+
+        if "id=" in line:
+            p_xuid = line.split("id=")[1].split(" ")[0].strip()
+            _player_id_cache[player_name] = p_xuid
+            database.update_player_identity(player_name, p_xuid)
+
+        action_line = line.split(">")[1].strip() if ">" in line else ""
+        action_line_lower = action_line.lower()
+
+        if "placed Fence Kit" in action_line:
+            base = database.get_base_at(x, z)
+            if not base:
+                from database import SEC_DB  # para o query rápido
+                import sqlite3
+
+                conn = sqlite3.connect(SEC_DB)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT discord_id FROM clan_members_247 WHERE gamertag = ?",
+                    (player_name,),
+                )
+                row = cur.fetchone()
+                d_id = row[0] if row else None
+                conn.close()
+
+                database.register_new_base(player_name, x, z, d_id)
+                print(f"[BASE] {player_name} registrou base em {x}, {z}")
+
+        elif "placed" in action_line_lower or "dismantled" in action_line_lower:
+            is_dismantle = "dismantled" in action_line_lower
+            br_now = datetime.now(timezone.utc) - timedelta(hours=3)
+            if is_dismantle and br_now.weekday() == 5 and 20 <= br_now.hour < 22:
+                return
+
+            base = database.get_base_at(x, z)
+            if base:
+                if base["owner"] == player_name:
+                    return
+
+                dono_discord = base["owner_discord_id"]
+                if dono_discord:
+                    clan_id = database.get_clan_id_by_member(dono_discord)
+                    if clan_id:
+                        members = database.get_clan_members_gamertags(clan_id)
+                        if player_name in members:
+                            return
+
+                guests = database.get_base_permissions(base["id"])
+                if player_name in guests:
+                    return
+
+                action_name = (
+                    "Desmonte"
+                    if is_dismantle
+                    else f"Construção/Invasão ({action_line})"
+                )
+                msg = f"🚫 **BANIMENTO AUTOMÁTICO**\nO jogador **{player_name}** foi pego praticando **{action_name}** na base de **{base['owner']}** sem permissão!\nCoordenadas: {int(x)}, {int(z)}"
+                await notify_ban(msg)
+
+                from auto_ban_system import ban_player_immediate
+
+                ban_player_immediate(
+                    player_name,
+                    _player_id_cache.get(player_name),
+                    f"{action_name} em base de {base['owner']}",
+                    "raid_exploit",
+                )
+    except Exception as e:
+        print(f"[PARSE ERROR] {e}")
+
+
+# --- TASKS & INIT ---
+
+
+@tasks.loop(seconds=60)
+async def raid_scheduler():
+    br_now = datetime.now(timezone.utc) - timedelta(hours=3)
+    if br_now.weekday() == 5:
+        if br_now.hour == 20 and br_now.minute == 0:
+            if download_file(GAMEPLAY_CONFIG_PATH, LOCAL_GAMEPLAY_CONFIG):
+                try:
+                    with open(LOCAL_GAMEPLAY_CONFIG, "r") as f:
+                        config = json.load(f)
+                    config["GeneralData"]["disableBaseDamage"] = False
+                    with open(LOCAL_GAMEPLAY_CONFIG, "w") as f:
+                        json.dump(config, f, indent=4)
+                    if upload_file(LOCAL_GAMEPLAY_CONFIG, GAMEPLAY_CONFIG_PATH):
+                        await restart_nitrado()
+                        await notify_ban(
+                            "🔥 **RAID INICIADO!** Dano em bases liberado até as 22:00!"
+                        )
+                except:
+                    pass
+        elif br_now.hour == 22 and br_now.minute == 0:
+            if download_file(GAMEPLAY_CONFIG_PATH, LOCAL_GAMEPLAY_CONFIG):
+                try:
+                    with open(LOCAL_GAMEPLAY_CONFIG, "r") as f:
+                        config = json.load(f)
+                    config["GeneralData"]["disableBaseDamage"] = True
+                    with open(LOCAL_GAMEPLAY_CONFIG, "w") as f:
+                        json.dump(config, f, indent=4)
+                    if upload_file(LOCAL_GAMEPLAY_CONFIG, GAMEPLAY_CONFIG_PATH):
+                        await restart_nitrado()
+                        await notify_ban(
+                            "🛑 **RAID ENCERRADO!** Dano em bases bloqueado!"
+                        )
+                except:
+                    pass
+
+
+async def notify_ban(message):
+    print(f"[NOTIFY] {message}")
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            requests.post(webhook_url, json={"content": message}, timeout=5)
+        except:
+            pass
+
+
+@tasks.loop(seconds=15)
+async def monitor_logs():
+    global last_byte_offset, current_log_file
+    ftp = connect_ftp()
+    if not ftp:
+        return
+    try:
+        if not current_log_file:
+            current_log_file = find_latest_adm_log(ftp)
+            if current_log_file:
+                ftp.voidcmd("TYPE I")
+                last_byte_offset = ftp.size(current_log_file)
+
+        if current_log_file:
+            ftp.voidcmd("TYPE I")
+            server_size = ftp.size(current_log_file)
+            if server_size > last_byte_offset:
+                bio = io.BytesIO()
+                ftp.retrbinary(
+                    f"RETR {current_log_file}", bio.write, rest=last_byte_offset
+                )
+                new_content = bio.getvalue().decode("utf-8", errors="ignore")
+                for line in new_content.split("\n"):
+                    if line.strip():
+                        await parse_log_line(line)
+                last_byte_offset = server_size
+    except Exception as e:
+        print(f"[MONITOR ERROR] {e}")
+    finally:
+        try:
+            ftp.quit()
+        except:
+            pass
+
+
+def find_latest_adm_log(ftp):
+    for path in ["/dayzxb/config", "/dayzxb", "/profile"]:
+        try:
+            ftp.cwd(path)
+            ftp.voidcmd("TYPE I")
+            items = ftp.nlst()
+            adm_files = [f"{path}/{f}" for f in items if f.lower().endswith(".adm")]
+            if adm_files:
+                return sorted(adm_files)[-1]
+        except:
+            continue
+    return None
+
+
+@bot.event
+async def on_ready():
+    print(f"[EVENT] Bot ready: {bot.user}")
+    if not monitor_logs.is_running():
+        monitor_logs.start()
+    if not raid_scheduler.is_running():
+        raid_scheduler.start()
+
+
+async def main():
+    async with bot:
+        database.init_db()
+        await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())

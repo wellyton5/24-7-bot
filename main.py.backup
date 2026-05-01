@@ -1,0 +1,443 @@
+import io
+import json
+import math
+import os
+from dotenv import load_dotenv
+import discord
+from discord.ext import tasks, commands
+from datetime import datetime, timedelta, timezone
+import requests
+
+# Importar auxiliares locais
+import database
+from ftp_helpers import connect_ftp, download_file, upload_file
+
+load_dotenv()
+
+# Configurações do Bot
+TOKEN = os.getenv("DISCORD_TOKEN")
+BAN_CHANNEL_ID = os.getenv("BAN_CHANNEL")
+BASE_RADIUS = os.getenv("BASE_RADIUS", 50)  # Raio de proteção da base em metros
+STATE_FILE = "bot_state.json"
+GAMEPLAY_CONFIG_PATH = (
+    "/dayzxb_missions/dayzOffline.chernarusplus/cfggameplay.json"  # Caminho padrão
+)
+LOCAL_GAMEPLAY_CONFIG = "cfggameplay_temp.json"
+
+# Configurações Nitrado (para Restart)
+NITRADO_TOKEN = os.getenv("NITRADO_TOKEN")
+SERVICE_ID = os.getenv("SERVICE_ID")
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Estado global para tailing
+current_log_file = ""
+last_byte_offset = 0
+
+
+def _is_garden(item_name):
+    """Verifica se o item é um tipo de garden/plantação."""
+    garden_keywords = [
+        "garden",
+        "greenhouse",
+        "planting",
+        "vegetable",
+        "plot",
+        "farming",
+    ]
+    item_lower = item_name.lower()
+    return any(keyword in item_lower for keyword in garden_keywords)
+
+
+def _is_fireplace(item_name):
+    """Verifica se o item é um tipo de fireplace/fogueira."""
+    fireplace_keywords = ["fireplace", "oven", "stove", "campfire", "fire"]
+    item_lower = item_name.lower()
+
+    # Verificação especial para barrel with holes
+    if "barrel" in item_lower and "hole" in item_lower:
+        return True
+
+    return any(keyword in item_lower for keyword in fireplace_keywords)
+
+
+def _is_garden_or_fireplace(item_name):
+    """Verifica se o item é garden OU fireplace."""
+    return _is_garden(item_name) or _is_fireplace(item_name)
+
+
+async def enforce_free_building():
+    """Garante que a construção livre esteja ativada no cfggameplay.json"""
+    print("[CONFIG] Verificando modo de construcao livre...")
+    if download_file(GAMEPLAY_CONFIG_PATH, LOCAL_GAMEPLAY_CONFIG):
+        try:
+            with open(LOCAL_GAMEPLAY_CONFIG, "r") as f:
+                config = json.load(f)
+
+            modified = False
+            hologram_data = config.get("BaseBuildingData", {}).get("HologramData", {})
+
+            # Lista de chaves que devem ser 'true' para construção livre total
+            keys_to_fix = [
+                "disableIsCollidingBBoxCheck",
+                "disableIsCollidingPlayerCheck",
+                "disableIsClippingRoofCheck",
+                "disableIsBaseViableCheck",
+                "disableIsCollidingGPlotCheck",
+                "disableIsCollidingAngleCheck",
+                "disableIsPlacementPermittedCheck",
+                "disableHeightPlacementCheck",
+                "disableIsUnderwaterCheck",
+                "disableIsInTerrainCheck",
+                "disableColdAreaBuildingCheck",
+            ]
+
+            for key in keys_to_fix:
+                if hologram_data.get(key) is not True:
+                    hologram_data[key] = True
+                    modified = True
+
+            if modified:
+                print("[CONFIG] Restricoes detectadas! Forcando construcao livre...")
+                with open(LOCAL_GAMEPLAY_CONFIG, "w") as f:
+                    json.dump(config, f, indent=4)
+
+                if upload_file(LOCAL_GAMEPLAY_CONFIG, GAMEPLAY_CONFIG_PATH):
+                    msg = "🛠️ **CONFIGURAÇÃO ALTERADA**\nO modo de **Construção Livre** foi forçado pelo bot. O servidor precisa ser reiniciado para aplicar!"
+                    await notify_ban(msg)
+                    print("[CONFIG] cfggameplay.json atualizado no servidor.")
+            else:
+                print("[CONFIG] Construcao livre ja esta 100% ativa.")
+
+        except Exception as e:
+            print(f"Erro ao processar JSON: {e}")
+        finally:
+            if os.path.exists(LOCAL_GAMEPLAY_CONFIG):
+                os.remove(LOCAL_GAMEPLAY_CONFIG)
+    else:
+        print("[CONFIG] Nao foi possivel baixar o cfggameplay.json para verificar.")
+
+
+async def restart_nitrado():
+    """Chama a API da Nitrado para reiniciar o servidor."""
+    if not NITRADO_TOKEN or not SERVICE_ID:
+        print("[NITRADO] Erro: Credenciais ausentes no .env")
+        return False
+
+    url = f"https://api.nitrado.net/services/{SERVICE_ID}/gameservers/restart"
+    headers = {"Authorization": f"Bearer {NITRADO_TOKEN}"}
+
+    try:
+        response = requests.post(url, headers=headers)
+        if response.status_code == 200:
+            print("[NITRADO] Comando de restart enviado com sucesso!")
+            return True
+        else:
+            print(
+                f"[NITRADO] Erro no restart: {response.status_code} - {response.text}"
+            )
+            return False
+    except Exception as e:
+        print(f"[NITRADO] Erro de conexao: {e}")
+        return False
+
+
+@tasks.loop(seconds=60)
+async def raid_scheduler():
+    """Agendador para desativar o Raid aos Sabados as 22:00 BRT."""
+    # Horário de Brasília (UTC-3)
+    br_now = datetime.now(timezone.utc) - timedelta(hours=3)
+
+    # Sábado = 5 (0: Seg, ..., 5: Sab, 6: Dom)
+    if br_now.weekday() == 5:
+        if br_now.hour == 22 and br_now.minute == 0:
+            print("[RAID] HORA DE ENCERRAR O RAID! Ajustando configuracoes...")
+
+            # 1. Desativar Dano em Base no cfggameplay.json
+            if download_file(GAMEPLAY_CONFIG_PATH, LOCAL_GAMEPLAY_CONFIG):
+                try:
+                    with open(LOCAL_GAMEPLAY_CONFIG, "r") as f:
+                        config = json.load(f)
+
+                    if (
+                        config.get("GeneralData", {}).get("disableBaseDamage")
+                        is not True
+                    ):
+                        config["GeneralData"]["disableBaseDamage"] = True
+
+                        with open(LOCAL_GAMEPLAY_CONFIG, "w") as f:
+                            json.dump(config, f, indent=4)
+
+                        if upload_file(LOCAL_GAMEPLAY_CONFIG, GAMEPLAY_CONFIG_PATH):
+                            print("[RAID] JSON atualizado. Reiniciando servidor...")
+
+                            # 2. Reiniciar Servidor
+                            if await restart_nitrado():
+                                msg = "🛑 **FIM DO RAID (AGENDADO)**\nO Raid foi encerrado automaticamente. Dano em bases desativado e servidor reiniciando!"
+                                await notify_ban(msg)
+                except Exception as e:
+                    print(f"[RAID] Erro ao processar Raid JSON: {e}")
+                finally:
+                    if os.path.exists(LOCAL_GAMEPLAY_CONFIG):
+                        os.remove(LOCAL_GAMEPLAY_CONFIG)
+
+
+def get_base_at(x, z):
+    """Verifica se existe uma base nas coordenadas e retorna o dono."""
+    bases = database.get_security_bases()
+    for base in bases:
+        dist = math.sqrt((x - base["x"]) ** 2 + (z - base["z"]) ** 2)
+        if dist <= base["radius"]:
+            return base
+    return None
+
+
+async def parse_log_line(line):
+    """Processa uma linha do log e aplica as regras de segurança."""
+    line = line.strip()
+    if not line:
+        return
+
+    import re
+    from auto_ban_system import ban_player_immediate
+
+    # 0. DETECÇÃO DE LOGIN (Captura de XUID)
+    # Ex: 10:20:30 | Player "Nome" (id=HASH pos=<...>) connected
+    if "connected" in line.lower() and "player" in line.lower():
+        pattern_login = r'Player "(?P<name>[^"]+)" \(id=(?P<xuid>[^ ]+) pos='
+        match_login = re.search(pattern_login, line)
+        if match_login:
+            p_name = match_login.group("name")
+            p_xuid = match_login.group("xuid")
+            database.update_player_identity(p_name, p_xuid)
+            print(f"[SYNC] Identidade sincronizada: {p_name} ({p_xuid})")
+            return
+
+    # Regex para extrair Jogador, Coordenadas e o Resto da linha
+    pattern = r'Player "(?P<name>[^"]+)" \(id=[^ ]+ pos=<(?P<coords>[^>]+)>\)(?P<action_line>.+)'
+    match = re.search(pattern, line)
+
+    if not match:
+        # Tentar formato alternativo (alguns logs tem espaço antes do Built ou usam 'at <')
+        pattern_alt = r'Player "(?P<name>[^"]+)" .*(?:at|pos)=<(?P<coords>[^>]+)>.*'
+        match = re.search(pattern_alt, line)
+        if not match:
+            return
+
+    player_name = match.group("name")
+    coords_str = match.group("coords")
+    action_line = (
+        match.group("action_line") if "action_line" in match.groupdict() else line
+    )
+
+    try:
+        x, y, z = map(float, coords_str.split(","))
+    except:
+        return
+
+    action_line_lower = action_line.lower()
+
+    # 1. DETECÇÃO DE CONSTRUÇÃO (Fence/Gate/Watchtower)
+    if "built" in action_line_lower:
+        # Extrair o que foi construído (ex: base, wall_base_down, etc)
+        # FIX: Melhorar extração para lidar com "Built" colado no ">"
+        parts = re.split(r"built\s+", action_line, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            item_name = parts[1].split(" on")[0].split(" with")[0].strip()
+        else:
+            # Caso "Built" esteja colado no final do match anterior
+            item_name = (
+                action_line.split(" ")[-1] if " " in action_line else "desconhecido"
+            )
+
+        base = get_base_at(x, z)
+        if base:
+            if base["owner"] != player_name:
+                # INVASÃO!
+                msg = f"🚫 **BANIMENTO POR INVASÃO**\nO jogador **{player_name}** tentou construir (**{item_name}**) na base de **{base['owner']}**!"
+                await notify_ban(msg)
+                ban_player_immediate(
+                    player_name,
+                    None,
+                    f"Invasão de Base: Construindo {item_name} em área de {base['owner']}",
+                    "territory_invasion",
+                )
+        else:
+            # Registro de Soberania (Apenas Cercas e Portões iniciam uma base)
+            # FIX: Melhorar verificação de fence/gate para ser mais flexível
+            if any(k in action_line_lower for k in ["fence", "gate", "watchtower"]):
+                database.register_new_base(player_name, x, z)
+                msg = f"🏰 **NOVA BASE REGISTRADA**\nO jogador **{player_name}** assumiu a soberania do território nas coordenadas **[{int(x)}, {int(z)}]**.\nA área de 50m ao redor agora está sob proteção oficial do bot!"
+                await notify_ban(msg)
+                print(f"[BASE REGISTRED] {player_name} em {x}, {z}")
+
+    # 2. DETECÇÃO DE COLOCAÇÃO DE ITENS (placed)
+    elif "placed" in action_line_lower:
+        # Ex: placed Fence Kit<FenceKit> ou placed GardenPlot<GardenPlot>
+        parts = re.split(r"placed\s+", action_line, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            item_name = parts[1].split("<")[0].strip()
+        else:
+            item_name = "item"
+
+        base = get_base_at(x, z)
+        if base:
+            if base["owner"] != player_name:
+                msg = f"🚫 **BANIMENTO POR INVASÃO**\nO jogador **{player_name}** tentou colocar um item (**{item_name}**) na base de **{base['owner']}**!"
+                await notify_ban(msg)
+                ban_player_immediate(
+                    player_name,
+                    None,
+                    f"Invasão de Base: Colocando {item_name} na área de {base['owner']}",
+                    "territory_invasion",
+                )
+        else:
+            # REGRAS DE LIMITE GLOBAL (Fogueiras e Jardins) - DETECÇÃO MELHORADA
+            if _is_garden_or_fireplace(item_name):
+                database.increment_item_count(player_name, item_name)
+                count = database.get_item_count(player_name, item_name)
+                if count > 2:
+                    item_type = "plantação" if _is_garden(item_name) else "fogueira"
+                    msg = f"🚫 **BANIMENTO POR LIMITE**\nO jogador **{player_name}** excedeu o limite global de 2 {item_type}s fora de base! Item: **{item_name}**"
+                    await notify_ban(msg)
+                    ban_player_immediate(
+                        player_name,
+                        None,
+                        f"Excesso de {item_name} fora de base (Limite: 2)",
+                        "garden_exploit",
+                    )
+
+    # 3. DETECÇÃO DE RAID (Dismantled)
+    elif "dismantled" in action_line_lower:
+        parts = re.split(r"dismantled\s+", action_line, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            item_name = parts[1].split(" (")[0].strip()
+        else:
+            item_name = "estrutura"
+        base = get_base_at(x, z)
+        if base and base["owner"] != player_name:
+            msg = f"⚔️ **BANIMENTO POR RAID**\nO jogador **{player_name}** foi banido por desmontar estruturas na base de **{base['owner']}**!"
+            await notify_ban(msg)
+            ban_player_immediate(
+                player_name,
+                None,
+                f"Raid em Base Protegida: Desmontando {item_name} de {base['owner']}",
+                "raid_exploit",
+            )
+
+
+async def notify_ban(message):
+    """Envia notificação via Webhook (mais estável) e tenta via Bot Channel."""
+    print(f"[NOTIFY] {message}")
+
+    # 1. Tentar via Webhook (Prioridade por ser mais estável)
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            requests.post(webhook_url, json={"content": message}, timeout=5)
+        except Exception as e:
+            print(f"[WEBHOOK ERROR] {e}")
+
+    # 2. Tentar via Bot (Redundância)
+    if BAN_CHANNEL_ID:
+        try:
+            channel = bot.get_channel(int(BAN_CHANNEL_ID))
+            if not channel:
+                channel = await bot.fetch_channel(int(BAN_CHANNEL_ID))
+            if channel:
+                await channel.send(message)
+        except Exception as e:
+            print(f"[BOT MSG ERROR] {e}")
+
+
+def find_latest_adm_log(ftp):
+    for path in ["/dayzxb/config", "/dayzxb", "/profile"]:
+        try:
+            ftp.cwd(path)
+            items = ftp.nlst()
+            adm_files = [f"{path}/{f}" for f in items if f.lower().endswith(".adm")]
+            if adm_files:
+                adm_files.sort()
+                return adm_files[-1]
+        except:
+            continue
+    return None
+
+
+@tasks.loop(seconds=15)
+async def monitor_logs():
+    global last_byte_offset, current_log_file
+    ftp = connect_ftp()
+    if not ftp:
+        return
+
+    try:
+        if not current_log_file:
+            current_log_file = find_latest_adm_log(ftp)
+            if current_log_file:
+                ftp.voidcmd("TYPE I")
+                last_byte_offset = ftp.size(current_log_file)
+
+        if current_log_file:
+            ftp.voidcmd("TYPE I")
+            server_size = ftp.size(current_log_file)
+
+            if server_size < last_byte_offset:  # Rotacionou
+                last_byte_offset = 0
+                current_log_file = find_latest_adm_log(ftp)
+
+            if server_size > last_byte_offset:
+                diff = server_size - last_byte_offset
+                print(f"[MONITOR] Lendo {diff} novos bytes de {current_log_file}")
+
+                bio = io.BytesIO()
+                ftp.retrbinary(
+                    f"RETR {current_log_file}", bio.write, rest=last_byte_offset
+                )
+                new_content = bio.getvalue().decode("utf-8", errors="ignore")
+                for line in new_content.split("\n"):
+                    if line.strip():
+                        await parse_log_line(line)
+                last_byte_offset = server_size
+    except Exception as e:
+        print(f"Log Error: {e}")
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+
+@bot.event
+async def on_ready():
+    """Event handler do Discord"""
+    print(f"[EVENT] ✅ Bot ready: {bot.user}")
+
+
+async def main():
+    """Função principal com inicialização manual"""
+    async with bot:
+        # Inicializar antes de conectar
+        print("[INIT] Inicializando banco de dados...")
+        database.init_db()
+
+        print("[INIT] Aplicando free building...")
+        await enforce_free_building()
+
+        print("[INIT] Iniciando tasks...")
+        monitor_logs.start()
+        raid_scheduler.start()
+
+        print("[INIT] Bot 24/7 operacional!")
+
+        # Conectar ao Discord
+        await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    print("[MAIN] Iniciando bot 24/7...")
+    asyncio.run(main())

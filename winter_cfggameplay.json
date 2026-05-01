@@ -1,0 +1,178 @@
+{
+    "version": 123,
+    "GeneralData": {
+        "disableBaseDamage": true,
+        "disableContainerDamage": false,
+        "disableRespawnDialog": false,
+        "disableRespawnInUnconsciousness": true
+    },
+    "PlayerData": {
+        "disablePersonalLight": false,
+        "spawnGearPresetFiles": [
+            "custom/vestimentaTEXAS.json"
+        ],
+        "StaminaData": {
+            "sprintStaminaModifierErc": 0,
+            "sprintStaminaModifierCro": 0,
+            "staminaWeightLimitThreshold": 6000,
+            "staminaMax": 300,
+            "staminaKgToStaminaPercentPenalty": 0,
+            "staminaMinCap": 1,
+            "sprintSwimmingStaminaModifier": 1,
+            "sprintLadderStaminaModifier": 1,
+            "meleeStaminaModifier": 1,
+            "obstacleTraversalStaminaModifier": 1,
+            "holdBreathStaminaModifier": 1
+        },
+        "ShockHandlingData": {
+            "shockRefillSpeedConscious": 5,
+            "shockRefillSpeedUnconscious": 1,
+            "allowRefillSpeedModifier": true
+        },
+        "MovementData": {
+            "timeToStrafeJog": 0.1,
+            "rotationSpeedJog": 0.3,
+            "timeToSprint": 0.45,
+            "timeToStrafeSprint": 0.3,
+            "rotationSpeedSprint": 0.15,
+            "allowStaminaAffectInertia": true
+        },
+        "DrowningData": {
+            "staminaDepletionSpeed": 10.0,
+            "healthDepletionSpeed": 10.0,
+            "shockDepletionSpeed": 10.0
+        },
+        "WeaponObstructionData": {
+            "staticMode": 1,
+            "dynamicMode": 1
+        }
+    },
+    "WorldsData": {
+        "lightingConfig": 0,
+        "objectSpawnersArr": [
+            "./custom/Sobar_By_SHOTSx3_.json",
+            "./custom/BASE_EMANUEL3 (1).json",
+            "./custom/Bunker_Black_Lake.json",
+            "./custom/p0nte_prison_island.json",
+            "./custom/ponte1iprisonilha.json",
+            "./custom/novybunker.json",
+            "./custom/BuildPalletkit_processed (3).json",
+            "./custom/ZAPADbunker.json"
+        ],
+        "environmentMinTemps": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+        ],
+        "environmentMaxTemps": [
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8
+        ],
+        "wetnessWeightModifiers": [
+            1,
+            1,
+            1.33,
+            1.66,
+            2
+        ],
+        "WeatherData": {
+            "overcast": 0.4,
+            "rain": 0.0,
+            "fog": 0.0,
+            "wind": 0.1
+        }
+    },
+    "BaseBuildingData": {
+        "HologramData": {
+            "disableIsCollidingBBoxCheck": true,
+            "disableIsCollidingPlayerCheck": true,
+            "disableIsClippingRoofCheck": true,
+            "disableIsBaseViableCheck": true,
+            "disableIsCollidingGPlotCheck": true,
+            "disableIsCollidingAngleCheck": true,
+            "disableIsPlacementPermittedCheck": true,
+            "disableHeightPlacementCheck": true,
+            "disableIsUnderwaterCheck": true,
+            "disableIsInTerrainCheck": true,
+            "disableColdAreaBuildingCheck": true,
+            "disallowedTypesInUnderground": [
+                "FenceKit",
+                "TerritoryFlagKit",
+                "WatchtowerKit"
+            ]
+        },
+        "ConstructionDecayData": {
+            "enableBaseDecay": 1,
+            "decayTimeMinutes": 86400,
+            "refreshFlagDecayTimeMinutes": 86400
+        },
+        "ConstructionData": {
+            "disablePerformRoofCheck": true,
+            "disableIsCollidingCheck": true,
+            "disableDistanceCheck": true
+        }
+    },
+    "UIData": {
+        "use3DMap": false,
+        "HitIndicationData": {
+            "hitDirectionOverrideEnabled": false,
+            "hitDirectionBehaviour": 1,
+            "hitDirectionStyle": 0,
+            "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+            "hitDirectionMaxDuration": 2.0,
+            "hitDirectionBreakPointRelative": 0.2,
+            "hitDirectionScatter": 10.0,
+            "hitIndicationPostProcessEnabled": true
+        }
+    },
+    "MapData": {
+        "ignoreMapOwnership": true,
+        "ignoreNavItemsOwnership": true,
+        "displayPlayerPosition": true,
+        "displayNavInfo": true
+    },
+    "VehicleData": {
+        "boatDecayMultiplier": 1
+    },
+    "PlayerSpawnSettings": {
+        "use_custom_spawn_points": 1,
+        "spawn_type": 1
+    },
+    "Buffs": {
+        "HealthRegen": 15.0,
+        "BloodRegen": 4.0,
+        "ShockRegen": 5.0,
+        "ClothingDamageMultiplier": 0.1,
+        "FoodConsumption": 0.5,
+        "WaterConsumption": 0.5,
+        "DiseaseImmunity": {
+            "cholera": true,
+            "parasites": true,
+            "influenza": true,
+            "salmonella": true,
+            "cold": true,
+            "poisoning": true,
+            "woundInfection": true
+        },
+        "SwimStaminaCost": 0.3
+    }
+}

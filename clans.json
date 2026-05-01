@@ -1,0 +1,10 @@
+{
+    "TEST_CLAN": {
+        "leader": "123456789",
+        "members": [
+            "987654321"
+        ],
+        "total_kills": 0,
+        "total_deaths": 0
+    }
+}

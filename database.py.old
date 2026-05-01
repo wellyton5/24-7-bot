@@ -1,0 +1,323 @@
+import json
+import os
+import sqlite3
+import math
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_NAME = "pvp_events.db"
+SEC_DB = "security.db"
+
+
+def init_db():
+    """Inicializa o banco de dados de segurança para o 24/7 Bot."""
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+
+    # Tabela de Bases Dinâmicas (Soberania)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bases_security (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_gamertag TEXT NOT NULL,
+        owner_discord_id TEXT,
+        coord_x REAL NOT NULL,
+        coord_z REAL NOT NULL,
+        radius REAL DEFAULT 50.0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    # Tabela de Rastreio de Itens (Limites)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS item_limits (
+        gamertag TEXT NOT NULL,
+        item_type TEXT NOT NULL,
+        count INTEGER DEFAULT 0,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (gamertag, item_type)
+    )
+    """)
+
+    # Tabela de Clãs (24/7 Bot local)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clans_247 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        leader_discord_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    # Tabela de Membros de Clã
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clan_members_247 (
+        clan_id INTEGER,
+        discord_id TEXT NOT NULL,
+        gamertag TEXT,
+        role TEXT DEFAULT 'member',
+        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (clan_id, discord_id),
+        FOREIGN KEY (clan_id) REFERENCES clans_247(id) ON DELETE CASCADE
+    )
+    """)
+
+    # Tabela de Convidados de Base
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS base_permissions (
+        base_id INTEGER,
+        gamertag_authorized TEXT NOT NULL,
+        authorized_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (base_id, gamertag_authorized),
+        FOREIGN KEY (base_id) REFERENCES bases_security(id) ON DELETE CASCADE
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+    print("Banco de dados security.db inicializado.")
+
+
+# --- BASES ---
+
+
+def register_new_base(gamertag, x, z, discord_id=None):
+    """Registra uma nova base para o primeiro construtor."""
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO bases_security (owner_gamertag, coord_x, coord_z, owner_discord_id) VALUES (?, ?, ?, ?)",
+        (gamertag, x, z, discord_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_security_bases():
+    """Retorna todas as bases de segurança para verificação de perímetro."""
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, owner_gamertag, coord_x, coord_z, radius, owner_discord_id FROM bases_security"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "owner": r[1],
+            "x": r[2],
+            "z": r[3],
+            "radius": r[4],
+            "owner_discord_id": r[5],
+        }
+        for r in rows
+    ]
+
+
+def get_base_at(x, z):
+    """Verifica se existe uma base nas coordenadas e retorna o dono."""
+    bases = get_security_bases()
+    for base in bases:
+        dist = math.sqrt((x - base["x"]) ** 2 + (z - base["z"]) ** 2)
+        if dist <= base["radius"]:
+            return base
+    return None
+
+
+# --- PERMISSÕES DE BASE ---
+
+
+def authorize_guest(base_id, gamertag_guest, authorized_by_discord_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO base_permissions (base_id, gamertag_authorized, authorized_by) VALUES (?, ?, ?)",
+        (base_id, gamertag_guest, str(authorized_by_discord_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def revoke_guest(base_id, gamertag_guest):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM base_permissions WHERE base_id = ? AND gamertag_authorized = ?",
+        (base_id, gamertag_guest),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_base_permissions(base_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT gamertag_authorized FROM base_permissions WHERE base_id = ?", (base_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+# --- CLÃS ---
+
+
+def create_clan(name, leader_discord_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO clans_247 (name, leader_discord_id) VALUES (?, ?)",
+            (name, str(leader_discord_id)),
+        )
+        clan_id = cur.lastrowid
+        conn.commit()
+        return clan_id
+    except sqlite3.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+
+def get_clan_by_leader(discord_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name FROM clans_247 WHERE leader_discord_id = ?", (str(discord_id),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return {"id": row[0], "name": row[1]} if row else None
+
+
+def get_clan_id_by_member(discord_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT clan_id FROM clan_members_247 WHERE discord_id = ?", (str(discord_id),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def add_clan_member(clan_id, discord_id, gamertag=None):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO clan_members_247 (clan_id, discord_id, gamertag) VALUES (?, ?, ?)",
+        (clan_id, str(discord_id), gamertag),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_clan_members_gamertags(clan_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT gamertag FROM clan_members_247 WHERE clan_id = ? AND gamertag IS NOT NULL",
+        (clan_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def remove_clan_member(clan_id, discord_id):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM clan_members_247 WHERE clan_id = ? AND discord_id = ?",
+        (clan_id, str(discord_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- ITENS & LIMITES ---
+
+
+def get_item_count(gamertag, item_type):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT count FROM item_limits WHERE gamertag = ? AND item_type = ?",
+        (gamertag, item_type),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def increment_item_count(gamertag, item_type):
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO item_limits (gamertag, item_type, count, last_updated)
+        VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(gamertag, item_type) DO UPDATE SET
+        count = count + 1,
+        last_updated = CURRENT_TIMESTAMP
+    """,
+        (gamertag, item_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- PVP EVENTS ---
+
+
+def add_event(event_type, x, y, z, weapon, killer, victim, distance, timestamp):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO events (event_type, game_x, game_y, game_z, weapon, killer_name, victim_name, distance, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        (event_type, x, y, z, weapon, killer, victim, distance, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_player_identity(gamertag, xbox_id):
+    """Sincroniza Gamertag com Xbox ID no security.db (opcional, se quiser rastrear)"""
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_identities (
+            gamertag TEXT PRIMARY KEY,
+            xbox_id TEXT
+        )
+    """)
+    cur.execute(
+        "INSERT OR REPLACE INTO player_identities (gamertag, xbox_id) VALUES (?, ?)",
+        (gamertag, xbox_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_gamertag_by_discord(discord_id):
+    """(Simplificado) Busca gamertag associado no security.db"""
+    conn = sqlite3.connect(SEC_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT gamertag FROM clan_members_247 WHERE discord_id = ? LIMIT 1",
+        (str(discord_id),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+if __name__ == "__main__":
+    init_db()

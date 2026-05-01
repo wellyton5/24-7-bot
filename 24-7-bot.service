@@ -1,0 +1,16 @@
+[Unit]
+Description=24-7 DayZ Security Bot
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/24-7-Bot
+ExecStart=/home/ubuntu/24-7-Bot/venv/bin/python3 main_24-7.py
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=24-7-bot
+
+[Install]
+WantedBy=multi-user.target
