@@ -1,0 +1,44 @@
+# Secrets
+.env
+.env.local
+*.token
+*_secret*
+*_token*
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Backups
+*.bak
+*.bak.*
+*.bak2
+*_backup*
+backup_*.txt
+backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Logs
+*.log
+bot_log_state.json
+log_state*.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project-specific runtime data
+spawnabletypes_backup/
+*.xml.bak
